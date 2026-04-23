@@ -324,6 +324,16 @@ def fmt_percent(value):
     return f"{value:.0f}%"
 
 
+def fmt_remaining_percent(value):
+    if value in (None, "", "-"):
+        return "-"
+    try:
+        remaining = max(0.0, 100.0 - float(value))
+    except (TypeError, ValueError):
+        return "-"
+    return f"{remaining:.0f}%"
+
+
 def fmt_reset_short(ts):
     if not ts:
         return "-"
@@ -381,8 +391,8 @@ def read_usage(home: Path):
             primary = rate.get("primary") or {}
             secondary = rate.get("secondary") or {}
             return {
-                "primary": fmt_percent(primary.get("used_percent")),
-                "secondary": fmt_percent(secondary.get("used_percent")),
+                "primary": fmt_remaining_percent(primary.get("used_percent")),
+                "secondary": fmt_remaining_percent(secondary.get("used_percent")),
                 "primary_reset": fmt_reset_short(primary.get("resets_at")),
                 "secondary_reset": fmt_reset_long(secondary.get("resets_at")),
                 "plan": rate.get("plan_type") or "-",
@@ -542,7 +552,7 @@ for r in rows:
     else:
         print(line)
 print(border("-"))
-notes = "Notes: C='*' marks current shell profile. R5 is 5h reset time. R7 is 7d reset date+time."
+notes = "Notes: C='*' marks current shell profile. 5h/7d show remaining quota. R5 is 5h reset time. R7 is 7d reset date+time."
 for line in textwrap.wrap(notes, width=inner_width) or [""]:
     print(colorize(f"| {line:<{inner_width}} |", muted_color))
 print("+" + "-" * (table_width - 2) + "+")

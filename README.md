@@ -117,7 +117,7 @@ current  profile        login  account        5h  r5   7d  r7   plan
 
 Notes:
 
-- `5h` and `7d` are the last known Codex usage percentages seen in local session logs
+- `5h` and `7d` are the last known remaining quota percentages seen in local session logs
 - `R5` shows the 5-hour reset time
 - `R7` shows the 7-day reset date and time
 - they are not a live API query
