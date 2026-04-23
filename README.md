@@ -11,8 +11,8 @@ Instead, it keeps one home directory per account and switches between them.
 
 You only need these 3 commands:
 
+- `codex-switch <profile>`: switch directly to a profile
 - `login`: create or reuse a profile, then log that profile into a Codex account
-- `switch`: switch the current shell to a profile, or back to `default`
 - `list`: show all profiles plus the last known Codex usage snapshot for each one
 
 Optional cleanup command:
@@ -27,9 +27,9 @@ bash install.sh
 
 That installer:
 
-- links `bin/codex-switch` into `~/.local/bin/codex-switch`
+- links the backend script into `~/.local/bin/codex-switch-bin`
 - adds `~/.local/bin` to your shell `PATH` if needed
-- lets you use `codex-switch` directly after reloading your shell
+- installs a shell wrapper so `codex-switch hunk` can switch your current shell directly
 
 Then reload your shell once:
 
@@ -38,19 +38,6 @@ source ~/.zshrc
 ```
 
 If you use bash instead of zsh, reload `~/.bashrc` or `~/.bash_profile` instead.
-
-Optional shell helper:
-
-```bash
-eval "$(codex-switch shell-init zsh)"
-```
-
-That gives you:
-
-```bash
-codex_use main
-codex_use default
-```
 
 ## Workflow
 
@@ -65,9 +52,9 @@ printenv OPENAI_API_KEY_WORK | codex-switch login api-work --with-api-key
 Switch the current shell:
 
 ```bash
-eval "$(codex-switch switch main)"
-eval "$(codex-switch switch backup)"
-eval "$(codex-switch switch default)"
+codex-switch main
+codex-switch backup
+codex-switch default
 ```
 
 After switching, any plain `codex` command in that shell uses that account.
@@ -97,8 +84,8 @@ Notes:
 ## Commands
 
 ```text
+codex-switch <profile|default>
 codex-switch login <profile> [codex-login-args...]
-codex-switch switch <profile|default>
 codex-switch list
 codex-switch logout [profile|default]
 codex-switch version
@@ -109,9 +96,8 @@ codex-switch help
 
 These still work, but they are not the main interface anymore:
 
-- `use` -> `switch`
-- `off` -> `switch default`
-- `init-shell` -> `shell-init`
+- `codex-switch switch <profile>` -> switch explicitly
+- `codex-switch off` -> switch back to `default`
 
 ## GitHub install flow
 
@@ -120,6 +106,15 @@ Install from GitHub:
 ```bash
 git clone <repo-url>
 cd codex-cli-switch
+bash install.sh
+source ~/.zshrc
+```
+
+Update after pulling new changes:
+
+```bash
+cd codex-cli-switch
+git pull
 bash install.sh
 source ~/.zshrc
 ```

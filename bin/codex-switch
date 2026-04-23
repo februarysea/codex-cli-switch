@@ -10,6 +10,7 @@ VERSION="0.1.0"
 usage() {
   cat <<'EOF'
 Usage:
+  codex-switch <profile|default>
   codex-switch login <profile> [codex-login-args...]
   codex-switch switch <profile|default>
   codex-switch list
@@ -18,16 +19,16 @@ Usage:
   codex-switch help
 
 Examples:
+  codex-switch work
   codex-switch login work
-  eval "$(codex-switch switch work)"
-  eval "$(codex-switch switch default)"
+  codex-switch switch work
+  codex-switch default
   codex-switch logout default
   printenv OPENAI_API_KEY_WORK | codex-switch login api-work --with-api-key
 
 Compatibility aliases:
   use -> switch
   off -> switch default
-  init-shell -> shell-init
 EOF
 }
 
@@ -156,6 +157,32 @@ EOF
 
   printf 'export CODEX_HOME=%s\n' "$(shell_quote "$dir")"
   printf 'export CODEX_PROFILE=%s\n' "$(shell_quote "$profile")"
+}
+
+known_command() {
+  case "${1:-}" in
+    login|switch|use|activate|list|logout|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cmd_switch_hint() {
+  local profile="${1:-}"
+  cat <<EOF
+This command needs shell integration to switch the current shell.
+
+Use one of these:
+  eval "\$(codex-switch switch $profile)"
+  source ~/.zshrc
+
+If you installed with install.sh and reloaded your shell, plain:
+  codex-switch $profile
+will switch directly.
+EOF
 }
 
 cmd_list() {
@@ -420,6 +447,12 @@ cmd_version() {
 main() {
   local command="${1:-help}"
   shift || true
+
+  if ! known_command "$command"; then
+    validate_profile_name "$command"
+    cmd_switch_hint "$command"
+    exit 2
+  fi
 
   case "$command" in
     login)
