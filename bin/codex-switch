@@ -301,6 +301,7 @@ EOF
 cmd_list() {
   mkdir -p "$SWITCH_HOME"
   CURRENT_CODEX_HOME="${CODEX_HOME:-}" \
+  CURRENT_CODEX_PROFILE="${CODEX_PROFILE:-default}" \
   DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
   SWITCH_HOME="$SWITCH_HOME" \
   CODEX_SWITCH_VERSION="$VERSION" \
@@ -312,6 +313,7 @@ import textwrap
 from pathlib import Path
 
 current_home = os.environ.get("CURRENT_CODEX_HOME", "")
+current_profile = os.environ.get("CURRENT_CODEX_PROFILE", "default")
 default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
 switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
 
@@ -325,7 +327,7 @@ def fmt_percent(value):
 def fmt_reset(ts):
     if not ts:
         return "-"
-    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%m-%d %H:%M")
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%H:%M")
 
 
 def read_auth(home: Path):
@@ -375,10 +377,11 @@ def read_usage(home: Path):
             return {
                 "primary": fmt_percent(primary.get("used_percent")),
                 "secondary": fmt_percent(secondary.get("used_percent")),
-                "reset": fmt_reset(primary.get("resets_at")),
+                "primary_reset": fmt_reset(primary.get("resets_at")),
+                "secondary_reset": fmt_reset(secondary.get("resets_at")),
                 "plan": rate.get("plan_type") or "-",
             }
-    return {"primary": "-", "secondary": "-", "reset": "-", "plan": "-"}
+    return {"primary": "-", "secondary": "-", "primary_reset": "-", "secondary_reset": "-", "plan": "-"}
 
 
 rows = []
@@ -405,13 +408,26 @@ for name, home in homes:
         "account": auth["account"],
         "primary": usage["primary"],
         "secondary": usage["secondary"],
-        "reset": usage["reset"],
+        "primary_reset": usage["primary_reset"],
+        "secondary_reset": usage["secondary_reset"],
         "plan": usage["plan"],
     })
 
 if not rows:
     print("No Codex profiles found.")
     raise SystemExit(0)
+
+default_row = next((r for r in rows if r["profile"] == "default"), None)
+if default_row and default_row["account"] not in ("-", ""):
+    for row in rows:
+        if row["profile"] == "default":
+            continue
+        if row["account"] == default_row["account"]:
+            row["profile"] = f"{row['profile']}(default)"
+            if default_row["current"] == "*":
+                row["current"] = "*"
+            rows = [r for r in rows if r["profile"] != "default"]
+            break
 
 
 def border(fill="-"):
@@ -434,13 +450,13 @@ def fit_text(text, width):
 def compact_row(row_data):
     return {
         "current": row_data["current"],
-        "profile": fit_text(row_data["profile"], 8),
+        "profile": fit_text(row_data["profile"], 17),
         "logged_in": "yes" if row_data["logged_in"] == "yes" else "no",
-        "mode": fit_text(row_data["mode"], 7),
         "account": fit_text(row_data["account"], 13),
         "primary": row_data["primary"],
         "secondary": row_data["secondary"],
-        "reset": fit_text(row_data["reset"], 11),
+        "primary_reset": row_data["primary_reset"],
+        "secondary_reset": row_data["secondary_reset"],
         "plan": fit_text(row_data["plan"], 4),
     }
 
@@ -450,11 +466,11 @@ columns = [
     ("C", "current"),
     ("Profile", "profile"),
     ("Auth", "logged_in"),
-    ("Mode", "mode"),
     ("Account", "account"),
     ("5h", "primary"),
+    ("R5", "primary_reset"),
     ("7d", "secondary"),
-    ("Rst", "reset"),
+    ("R7", "secondary_reset"),
     ("Plan", "plan"),
 ]
 widths = {
@@ -467,9 +483,9 @@ title_left = "Codex Switch"
 title_right = f"v{os.environ.get('CODEX_SWITCH_VERSION', '0.1.0')}"
 summary_left = f"Profiles {len(rows)}"
 summary_right = now_label
-active_profile = next((r["profile"] for r in rows if r["current"] == "*"), "default")
+active_profile = current_profile or next((r["profile"] for r in rows if r["current"] == "*"), "default")
 status_left = f"Current {active_profile}"
-status_right = "Usage last-known local snapshot"
+status_right = "Reminder local snapshot"
 inner_width = table_width - 4
 use_color = os.isatty(1) and not os.environ.get("NO_COLOR")
 current_row_color = "\033[1;36m" if use_color else ""
@@ -507,11 +523,11 @@ for r in rows:
             r["current"],
             r["profile"],
             r["logged_in"],
-            r["mode"],
             r["account"],
             r["primary"],
+            r["primary_reset"],
             r["secondary"],
-            r["reset"],
+            r["secondary_reset"],
             r["plan"],
         ]
     )
@@ -520,7 +536,7 @@ for r in rows:
     else:
         print(line)
 print(border("-"))
-notes = "Notes: C='*' marks current shell profile. 5h/7d are last known local usage snapshots."
+notes = "Notes: C='*' marks current shell profile. R5/R7 are reset times for 5h and 7d windows."
 for line in textwrap.wrap(notes, width=inner_width) or [""]:
     print(colorize(f"| {line:<{inner_width}} |", muted_color))
 print("+" + "-" * (table_width - 2) + "+")

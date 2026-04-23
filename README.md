@@ -110,14 +110,15 @@ codex-switch list
 Example output:
 
 ```text
-current  profile  login  mode     account        5h  7d   reset        plan
-*        default  yes    chatgpt  abcd12...9xyz  6%  28%  04-23 14:50  plus
-         main     yes    chatgpt  efgh34...7uvw  2%  11%  04-23 15:10  plus
+current  profile        login  account        5h  r5   7d  r7   plan
+*        main(default)  yes    abcd12...9xyz  6%  14:50 28% 16:10 plus
+         work           yes    efgh34...7uvw  2%  15:10 11% 09:20 plus
 ```
 
 Notes:
 
 - `5h` and `7d` are the last known Codex usage percentages seen in local session logs
+- `R5` and `R7` are the reset times for those windows
 - they are not a live API query
 - `switch default` returns the shell to the normal `~/.codex`
 - `logout default` clears the saved login state in `~/.codex`
