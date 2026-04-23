@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SWITCH_HOME="${CODEX_SWITCH_HOME:-$HOME/.codex-profiles}"
+DEFAULT_CODEX_HOME="${HOME}/.codex"
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-switch login <profile> [codex-login-args...]
+  codex-switch switch <profile|default>
+  codex-switch list
+  codex-switch logout [profile|default]
+  codex-switch version
+  codex-switch help
+
+Examples:
+  codex-switch login work
+  eval "$(codex-switch switch work)"
+  eval "$(codex-switch switch default)"
+  codex-switch logout default
+  printenv OPENAI_API_KEY_WORK | codex-switch login api-work --with-api-key
+
+Compatibility aliases:
+  use -> switch
+  off -> switch default
+  init-shell -> shell-init
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_codex() {
+  command -v codex >/dev/null 2>&1 || die "codex is not installed or not in PATH"
+}
+
+validate_profile_name() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "profile name is required"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "profile name must match [A-Za-z0-9._-]+"
+}
+
+is_default_profile() {
+  local name="${1:-}"
+  [[ "$name" == "default" || "$name" == "-" ]]
+}
+
+profile_dir() {
+  if is_default_profile "${1:-}"; then
+    printf '%s\n' "$DEFAULT_CODEX_HOME"
+    return 0
+  fi
+  validate_profile_name "$1"
+  printf '%s/%s\n' "$SWITCH_HOME" "$1"
+}
+
+ensure_profile_dir() {
+  local dir
+  dir="$(profile_dir "$1")"
+  mkdir -p "$dir"
+  printf '%s\n' "$dir"
+}
+
+copy_config_if_present() {
+  local dest_dir="$1"
+  local source_home="${CODEX_HOME:-$DEFAULT_CODEX_HOME}"
+  local source_config="${source_home}/config.toml"
+  local dest_config="${dest_dir}/config.toml"
+
+  if [[ -f "$source_config" && ! -f "$dest_config" ]]; then
+    cp "$source_config" "$dest_config"
+  fi
+}
+
+cmd_login() {
+  local profile="${1:-}"
+  shift || true
+
+  require_codex
+
+  local dir
+  if is_default_profile "$profile"; then
+    dir="$DEFAULT_CODEX_HOME"
+    mkdir -p "$dir"
+  else
+    validate_profile_name "$profile"
+    dir="$(ensure_profile_dir "$profile")"
+    copy_config_if_present "$dir"
+  fi
+
+  CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex login "$@"
+}
+
+cmd_logout() {
+  local profile="${1:-default}"
+
+  require_codex
+
+  local dir
+  if is_default_profile "$profile"; then
+    dir="$DEFAULT_CODEX_HOME"
+    mkdir -p "$dir"
+    CODEX_HOME="$dir" codex logout
+  else
+    validate_profile_name "$profile"
+    dir="$(profile_dir "$profile")"
+    [[ -d "$dir" ]] || die "profile '$profile' does not exist"
+    CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex logout
+  fi
+}
+
+cmd_run() {
+  local profile="${1:-}"
+  shift || true
+
+  validate_profile_name "$profile"
+  require_codex
+
+  if (($#)) && [[ "$1" == "--" ]]; then
+    shift
+  fi
+
+  local dir
+  dir="$(profile_dir "$profile")"
+  [[ -d "$dir" ]] || die "profile '$profile' does not exist; run 'codex-switch create $profile' first"
+
+  CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex "$@"
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+cmd_switch() {
+  local profile="${1:-}"
+
+  if is_default_profile "$profile"; then
+    cat <<'EOF'
+unset CODEX_HOME
+unset CODEX_PROFILE
+EOF
+    return 0
+  fi
+
+  validate_profile_name "$profile"
+
+  local dir
+  dir="$(profile_dir "$profile")"
+  [[ -d "$dir" ]] || die "profile '$profile' does not exist"
+
+  printf 'export CODEX_HOME=%s\n' "$(shell_quote "$dir")"
+  printf 'export CODEX_PROFILE=%s\n' "$(shell_quote "$profile")"
+}
+
+cmd_list() {
+  mkdir -p "$SWITCH_HOME"
+  CURRENT_CODEX_HOME="${CODEX_HOME:-}" \
+  DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
+  SWITCH_HOME="$SWITCH_HOME" \
+  CODEX_SWITCH_VERSION="$VERSION" \
+  python3 - <<'PY'
+import datetime as dt
+import json
+import os
+import textwrap
+from pathlib import Path
+
+current_home = os.environ.get("CURRENT_CODEX_HOME", "")
+default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
+switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+
+
+def fmt_percent(value):
+    if value in (None, "", "-"):
+        return "-"
+    return f"{value:.0f}%"
+
+
+def fmt_reset(ts):
+    if not ts:
+        return "-"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%m-%d %H:%M")
+
+
+def read_auth(home: Path):
+    auth = home / "auth.json"
+    if not auth.exists():
+        return {"logged_in": "no", "mode": "-", "account": "-", "has_auth": False}
+    try:
+        obj = json.loads(auth.read_text())
+    except Exception:
+        return {"logged_in": "yes", "mode": "(unreadable)", "account": "-", "has_auth": True}
+    tokens = obj.get("tokens") if isinstance(obj.get("tokens"), dict) else {}
+    account = tokens.get("account_id") if isinstance(tokens, dict) else None
+    if isinstance(account, str) and len(account) > 12:
+        account = f"{account[:6]}...{account[-4:]}"
+    return {
+        "logged_in": "yes",
+        "mode": obj.get("auth_mode", "-"),
+        "account": account or "-",
+        "has_auth": True,
+    }
+
+
+def read_usage(home: Path):
+    roots = [home / "sessions", home / "archived_sessions"]
+    files = []
+    for root in roots:
+        if root.exists():
+            files.extend(p for p in root.rglob("*.jsonl") if p.is_file())
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for path in files:
+        try:
+            lines = path.read_text(errors="ignore").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            payload = obj.get("payload", {})
+            if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
+                continue
+            rate = payload.get("rate_limits") or {}
+            primary = rate.get("primary") or {}
+            secondary = rate.get("secondary") or {}
+            return {
+                "primary": fmt_percent(primary.get("used_percent")),
+                "secondary": fmt_percent(secondary.get("used_percent")),
+                "reset": fmt_reset(primary.get("resets_at")),
+                "plan": rate.get("plan_type") or "-",
+            }
+    return {"primary": "-", "secondary": "-", "reset": "-", "plan": "-"}
+
+
+rows = []
+homes = [("default", default_home)]
+if switch_home.exists():
+    for child in sorted(switch_home.iterdir()):
+        if child.is_dir():
+            homes.append((child.name, child))
+
+for name, home in homes:
+    auth = read_auth(home)
+    usage = read_usage(home)
+    if str(home) == current_home or (name == "default" and not current_home):
+      current = "*"
+    else:
+      current = " "
+    if name == "default" and not auth["has_auth"] and current != "*":
+      continue
+    rows.append({
+        "current": current,
+        "profile": name,
+        "logged_in": auth["logged_in"],
+        "mode": auth["mode"],
+        "account": auth["account"],
+        "primary": usage["primary"],
+        "secondary": usage["secondary"],
+        "reset": usage["reset"],
+        "plan": usage["plan"],
+    })
+
+if not rows:
+    print("No Codex profiles found.")
+    raise SystemExit(0)
+
+
+def border(fill="-"):
+    return "+" + "+".join(fill * (widths[label] + 2) for label, _ in columns) + "+"
+
+
+def row(values):
+    return "|" + "|".join(f" {str(value):<{widths[label]}} " for (label, _), value in zip(columns, values)) + "|"
+
+
+def fit_text(text, width):
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def compact_row(row_data):
+    return {
+        "current": row_data["current"],
+        "profile": fit_text(row_data["profile"], 8),
+        "logged_in": "yes" if row_data["logged_in"] == "yes" else "no",
+        "mode": fit_text(row_data["mode"], 7),
+        "account": fit_text(row_data["account"], 13),
+        "primary": row_data["primary"],
+        "secondary": row_data["secondary"],
+        "reset": fit_text(row_data["reset"], 11),
+        "plan": fit_text(row_data["plan"], 4),
+    }
+
+
+rows = [compact_row(r) for r in rows]
+columns = [
+    ("C", "current"),
+    ("Profile", "profile"),
+    ("Auth", "logged_in"),
+    ("Mode", "mode"),
+    ("Account", "account"),
+    ("5h", "primary"),
+    ("7d", "secondary"),
+    ("Rst", "reset"),
+    ("Plan", "plan"),
+]
+widths = {
+    label: max(len(label), *(len(str(r[key])) for r in rows))
+    for label, key in columns
+}
+table_width = len(border())
+now_label = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+title_left = "Codex Switch"
+title_right = f"v{os.environ.get('CODEX_SWITCH_VERSION', '0.1.0')}"
+summary_left = f"Profiles {len(rows)}"
+summary_right = now_label
+active_profile = next((r["profile"] for r in rows if r["current"] == "*"), "default")
+status_left = f"Current {active_profile}"
+status_right = "Usage last-known local snapshot"
+inner_width = table_width - 4
+use_color = os.isatty(1) and not os.environ.get("NO_COLOR")
+current_row_color = "\033[1;36m" if use_color else ""
+header_color = "\033[1m" if use_color else ""
+muted_color = "\033[2m" if use_color else ""
+reset_color = "\033[0m" if use_color else ""
+
+
+def title_line(left, right):
+    left = fit_text(left, inner_width)
+    right = fit_text(right, inner_width)
+    gap = inner_width - len(left) - len(right)
+    if gap < 1:
+        left = fit_text(left, inner_width - len(right) - 1)
+        gap = 1
+    return f"| {left}{' ' * gap}{right} |"
+
+
+def colorize(line, color):
+    if not color:
+        return line
+    return f"{color}{line}{reset_color}"
+
+
+print("+" + "-" * (table_width - 2) + "+")
+print(colorize(title_line(title_left, title_right), header_color))
+print(colorize(title_line(summary_left, summary_right), muted_color))
+print(colorize(title_line(status_left, status_right), muted_color))
+print(border("="))
+print(colorize(row([label for label, _ in columns]), header_color))
+print(border("-"))
+for r in rows:
+    line = row(
+        [
+            r["current"],
+            r["profile"],
+            r["logged_in"],
+            r["mode"],
+            r["account"],
+            r["primary"],
+            r["secondary"],
+            r["reset"],
+            r["plan"],
+        ]
+    )
+    if r["current"] == "*":
+        print(colorize(line, current_row_color))
+    else:
+        print(line)
+print(border("-"))
+notes = "Notes: C='*' marks current shell profile. 5h/7d are last known local usage snapshots."
+for line in textwrap.wrap(notes, width=inner_width) or [""]:
+    print(colorize(f"| {line:<{inner_width}} |", muted_color))
+print("+" + "-" * (table_width - 2) + "+")
+PY
+}
+
+cmd_shell_init() {
+  local shell_name="${1:-zsh}"
+  case "$shell_name" in
+    zsh|bash)
+      ;;
+    *)
+      die "init-shell only supports zsh or bash"
+      ;;
+  esac
+
+  cat <<EOF
+codex_switch_profile() {
+  local profile="\$1"
+  if [[ -z "\$profile" ]]; then
+    echo "usage: codex_switch_profile <profile|default>" >&2
+    return 1
+  fi
+  eval "\$("$SCRIPT_PATH" switch "\$profile")"
+}
+
+codex_use() {
+  codex_switch_profile "\$@"
+}
+EOF
+}
+
+cmd_version() {
+  printf '%s\n' "$VERSION"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    login)
+      cmd_login "$@"
+      ;;
+    switch|use|activate)
+      cmd_switch "$@"
+      ;;
+    list)
+      cmd_list
+      ;;
+    logout)
+      cmd_logout "$@"
+      ;;
+    run|exec)
+      cmd_run "$@"
+      ;;
+    off|deactivate)
+      cmd_switch default
+      ;;
+    shell-init|init-shell)
+      cmd_shell_init "$@"
+      ;;
+    version|--version|-V)
+      cmd_version
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
