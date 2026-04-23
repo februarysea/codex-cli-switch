@@ -5,7 +5,9 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SWITCH_HOME="${CODEX_SWITCH_HOME:-$HOME/.codex-profiles}"
 DEFAULT_CODEX_HOME="${HOME}/.codex"
-VERSION="0.1.0"
+SHARED_SKILLS_HOME="${CODEX_SWITCH_SHARED_HOME:-$HOME/.codex-shared}"
+SHARED_SKILLS_DIR="${CODEX_SWITCH_SHARED_SKILLS_DIR:-$SHARED_SKILLS_HOME/skills}"
+VERSION="0.2.0"
 
 usage() {
   cat <<'EOF'
@@ -15,6 +17,9 @@ Usage:
   codex-switch switch <profile|default>
   codex-switch list
   codex-switch logout [profile|default]
+  codex-switch skills path
+  codex-switch skills init
+  codex-switch skills sync [profile|default|all]
   codex-switch version
   codex-switch help
 
@@ -24,6 +29,8 @@ Examples:
   codex-switch switch work
   codex-switch default
   codex-switch logout default
+  codex-switch skills path
+  codex-switch skills sync all
   printenv OPENAI_API_KEY_WORK | codex-switch login api-work --with-api-key
 
 Compatibility aliases:
@@ -79,6 +86,63 @@ copy_config_if_present() {
   fi
 }
 
+ensure_shared_skills_dir() {
+  mkdir -p "$SHARED_SKILLS_DIR"
+}
+
+sync_shared_skills_to_home() {
+  local home_dir="$1"
+  local mode="${2:-quiet}"
+  local skills_dir="$home_dir/skills"
+  local linked=0
+  local skipped=0
+
+  ensure_shared_skills_dir
+  mkdir -p "$skills_dir"
+
+  local source
+  shopt -s nullglob dotglob
+  for source in "$SHARED_SKILLS_DIR"/*; do
+    [[ -e "$source" ]] || continue
+    local name target
+    name="$(basename "$source")"
+    target="$skills_dir/$name"
+
+    if [[ -L "$target" ]]; then
+      local current_target
+      current_target="$(readlink "$target" || true)"
+      if [[ "$current_target" == "$source" ]]; then
+        continue
+      fi
+      rm -f "$target"
+      ln -s "$source" "$target"
+      linked=$((linked + 1))
+      continue
+    fi
+
+    if [[ -e "$target" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    ln -s "$source" "$target"
+    linked=$((linked + 1))
+  done
+  shopt -u nullglob dotglob
+
+  if [[ "$mode" == "verbose" ]]; then
+    printf 'Synced shared skills into %s (linked=%d, skipped=%d)\n' "$home_dir" "$linked" "$skipped"
+  fi
+}
+
+sync_shared_skills_to_profile() {
+  local profile="${1:-default}"
+  local home_dir
+  home_dir="$(profile_dir "$profile")"
+  mkdir -p "$home_dir"
+  sync_shared_skills_to_home "$home_dir" "${2:-quiet}"
+}
+
 cmd_login() {
   local profile="${1:-}"
   shift || true
@@ -94,6 +158,8 @@ cmd_login() {
     dir="$(ensure_profile_dir "$profile")"
     copy_config_if_present "$dir"
   fi
+
+  sync_shared_skills_to_home "$dir" quiet
 
   CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex login "$@"
 }
@@ -154,14 +220,61 @@ EOF
   local dir
   dir="$(profile_dir "$profile")"
   [[ -d "$dir" ]] || die "profile '$profile' does not exist"
+  sync_shared_skills_to_home "$dir" quiet
 
   printf 'export CODEX_HOME=%s\n' "$(shell_quote "$dir")"
   printf 'export CODEX_PROFILE=%s\n' "$(shell_quote "$profile")"
 }
 
+cmd_skills() {
+  local subcommand="${1:-path}"
+  shift || true
+
+  case "$subcommand" in
+    path)
+      ensure_shared_skills_dir
+      printf '%s\n' "$SHARED_SKILLS_DIR"
+      ;;
+    init)
+      ensure_shared_skills_dir
+      sync_shared_skills_to_profile default verbose
+      if [[ -d "$SWITCH_HOME" ]]; then
+        local dir
+        shopt -s nullglob
+        for dir in "$SWITCH_HOME"/*; do
+          [[ -d "$dir" ]] || continue
+          sync_shared_skills_to_home "$dir" verbose
+        done
+        shopt -u nullglob
+      fi
+      printf 'Shared skills root: %s\n' "$SHARED_SKILLS_DIR"
+      ;;
+    sync)
+      local target="${1:-all}"
+      if [[ "$target" == "all" ]]; then
+        sync_shared_skills_to_profile default verbose
+        if [[ -d "$SWITCH_HOME" ]]; then
+          local dir
+          shopt -s nullglob
+          for dir in "$SWITCH_HOME"/*; do
+            [[ -d "$dir" ]] || continue
+            sync_shared_skills_to_home "$dir" verbose
+          done
+          shopt -u nullglob
+        fi
+      else
+        sync_shared_skills_to_profile "$target" verbose
+      fi
+      ;;
+    *)
+      die "unknown skills command: $subcommand"
+      ;;
+  esac
+}
+
 known_command() {
   case "${1:-}" in
-    login|switch|use|activate|list|logout|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
+    login|switch|use|activate|list|logout|skills|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
       return 0
       ;;
     *)
@@ -466,6 +579,9 @@ main() {
       ;;
     logout)
       cmd_logout "$@"
+      ;;
+    skills)
+      cmd_skills "$@"
       ;;
     run|exec)
       cmd_run "$@"

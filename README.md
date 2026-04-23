@@ -19,6 +19,12 @@ Optional cleanup command:
 
 - `logout [profile|default]`: remove saved login state from one profile
 
+Shared skills commands:
+
+- `codex-switch skills path`: print the shared skills root
+- `codex-switch skills init`: create the shared skills root and sync it to all profiles
+- `codex-switch skills sync all`: resync shared skills to every profile
+
 ## Setup
 
 ```bash
@@ -59,6 +65,42 @@ codex-switch default
 
 After switching, any plain `codex` command in that shell uses that account.
 
+## Shared skills
+
+Shared skills live in:
+
+```bash
+codex-switch skills path
+```
+
+By default that is:
+
+```text
+~/.codex-shared/skills
+```
+
+Recommended flow:
+
+```bash
+codex-switch skills init
+mkdir -p "$(codex-switch skills path)/my-team-skill"
+```
+
+Then put your `SKILL.md` inside that skill directory, for example:
+
+```text
+~/.codex-shared/skills/my-team-skill/SKILL.md
+```
+
+After adding or changing shared skills, run:
+
+```bash
+codex-switch skills sync all
+```
+
+That links the shared skills into every profile's `skills` directory.
+New profiles also get shared skills synced automatically when you `login` or `switch`.
+
 List profiles and last known usage:
 
 ```bash
@@ -88,6 +130,9 @@ codex-switch <profile|default>
 codex-switch login <profile> [codex-login-args...]
 codex-switch list
 codex-switch logout [profile|default]
+codex-switch skills path
+codex-switch skills init
+codex-switch skills sync [profile|default|all]
 codex-switch version
 codex-switch help
 ```

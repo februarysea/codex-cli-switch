@@ -97,7 +97,7 @@ codex-switch() {
   fi
 
   case "$1" in
-    login|list|logout|version|help|-h|--help|--version|-V)
+    login|list|logout|skills|version|help|-h|--help|--version|-V)
       command codex-switch-bin "$@"
       ;;
     switch|use|activate)
