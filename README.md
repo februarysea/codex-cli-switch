@@ -118,7 +118,8 @@ current  profile        login  account        5h  r5   7d  r7   plan
 Notes:
 
 - `5h` and `7d` are the last known Codex usage percentages seen in local session logs
-- `R5` and `R7` are the reset times for those windows
+- `R5` shows the 5-hour reset time
+- `R7` shows the 7-day reset date and time
 - they are not a live API query
 - `switch default` returns the shell to the normal `~/.codex`
 - `logout default` clears the saved login state in `~/.codex`

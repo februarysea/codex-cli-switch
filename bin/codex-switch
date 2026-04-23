@@ -324,10 +324,16 @@ def fmt_percent(value):
     return f"{value:.0f}%"
 
 
-def fmt_reset(ts):
+def fmt_reset_short(ts):
     if not ts:
         return "-"
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%H:%M")
+
+
+def fmt_reset_long(ts):
+    if not ts:
+        return "-"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%m-%d %H:%M")
 
 
 def read_auth(home: Path):
@@ -377,8 +383,8 @@ def read_usage(home: Path):
             return {
                 "primary": fmt_percent(primary.get("used_percent")),
                 "secondary": fmt_percent(secondary.get("used_percent")),
-                "primary_reset": fmt_reset(primary.get("resets_at")),
-                "secondary_reset": fmt_reset(secondary.get("resets_at")),
+                "primary_reset": fmt_reset_short(primary.get("resets_at")),
+                "secondary_reset": fmt_reset_long(secondary.get("resets_at")),
                 "plan": rate.get("plan_type") or "-",
             }
     return {"primary": "-", "secondary": "-", "primary_reset": "-", "secondary_reset": "-", "plan": "-"}
@@ -485,7 +491,7 @@ summary_left = f"Profiles {len(rows)}"
 summary_right = now_label
 active_profile = current_profile or next((r["profile"] for r in rows if r["current"] == "*"), "default")
 status_left = f"Current {active_profile}"
-status_right = "Reminder local snapshot"
+status_right = "Usage reminder"
 inner_width = table_width - 4
 use_color = os.isatty(1) and not os.environ.get("NO_COLOR")
 current_row_color = "\033[1;36m" if use_color else ""
@@ -536,7 +542,7 @@ for r in rows:
     else:
         print(line)
 print(border("-"))
-notes = "Notes: C='*' marks current shell profile. R5/R7 are reset times for 5h and 7d windows."
+notes = "Notes: C='*' marks current shell profile. R5 is 5h reset time. R7 is 7d reset date+time."
 for line in textwrap.wrap(notes, width=inner_width) or [""]:
     print(colorize(f"| {line:<{inner_width}} |", muted_color))
 print("+" + "-" * (table_width - 2) + "+")
