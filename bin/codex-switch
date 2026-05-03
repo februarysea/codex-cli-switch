@@ -7,7 +7,7 @@ SWITCH_HOME="${CODEX_SWITCH_HOME:-$HOME/.codex-profiles}"
 DEFAULT_CODEX_HOME="${HOME}/.codex"
 SHARED_SKILLS_HOME="${CODEX_SWITCH_SHARED_HOME:-$HOME/.codex-shared}"
 SHARED_SKILLS_DIR="${CODEX_SWITCH_SHARED_SKILLS_DIR:-$SHARED_SKILLS_HOME/skills}"
-VERSION="0.2.0"
+VERSION="0.3.3"
 
 usage() {
   cat <<'EOF'
@@ -16,6 +16,9 @@ Usage:
   codex-switch login <profile> [codex-login-args...]
   codex-switch switch <profile|default>
   codex-switch list
+  codex-switch resume [--limit N]
+  codex-switch resume [--profile <profile>] <resume-id|latest> [codex-resume-args...]
+  codex-switch resume <profile> <resume-id|latest> [codex-resume-args...]
   codex-switch logout [profile|default]
   codex-switch skills path
   codex-switch skills init
@@ -28,6 +31,8 @@ Examples:
   codex-switch login work
   codex-switch switch work
   codex-switch default
+  codex-switch resume
+  codex-switch resume 019ded9c-2f08-7160-8962-21cca812b52f
   codex-switch logout default
   codex-switch skills path
   codex-switch skills sync all
@@ -66,6 +71,14 @@ profile_dir() {
   fi
   validate_profile_name "$1"
   printf '%s/%s\n' "$SWITCH_HOME" "$1"
+}
+
+profile_exists() {
+  if is_default_profile "${1:-}"; then
+    return 0
+  fi
+  validate_profile_name "$1"
+  [[ -d "$(profile_dir "$1")" ]]
 }
 
 ensure_profile_dir() {
@@ -274,7 +287,7 @@ cmd_skills() {
 
 known_command() {
   case "${1:-}" in
-    login|switch|use|activate|list|logout|skills|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
+    login|switch|use|activate|list|resume|logout|skills|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
       return 0
       ;;
     *)
@@ -601,6 +614,673 @@ print("+" + "-" * (table_width - 2) + "+")
 PY
 }
 
+current_resume_profile() {
+  if [[ -n "${CODEX_PROFILE:-}" ]]; then
+    printf '%s\n' "$CODEX_PROFILE"
+    return 0
+  fi
+
+  local current_home="${CODEX_HOME:-}"
+  if [[ -z "$current_home" || "$current_home" == "$DEFAULT_CODEX_HOME" ]]; then
+    printf 'default\n'
+    return 0
+  fi
+
+  local switch_prefix="${SWITCH_HOME%/}/"
+  if [[ "$current_home" == "$switch_prefix"* ]]; then
+    local profile="${current_home#"$switch_prefix"}"
+    profile="${profile%%/*}"
+    if [[ -n "$profile" ]]; then
+      printf '%s\n' "$profile"
+      return 0
+    fi
+  fi
+
+  printf 'default\n'
+}
+
+resume_profile_dir() {
+  local profile="${1:-default}"
+  local dir
+
+  if is_default_profile "$profile"; then
+    dir="$DEFAULT_CODEX_HOME"
+    mkdir -p "$dir"
+  else
+    validate_profile_name "$profile"
+    dir="$(profile_dir "$profile")"
+    [[ -d "$dir" ]] || die "target profile '$profile' does not exist; run 'codex-switch login $profile' first"
+  fi
+
+  printf '%s\n' "$dir"
+}
+
+link_session_to_home() {
+  local source_path="$1"
+  local source_home="$2"
+  local target_home="$3"
+  local resume_id="$4"
+
+  [[ -f "$source_path" ]] || die "session file for $resume_id is missing: $source_path"
+
+  local source_real
+  source_real="$(readlink -f "$source_path" 2>/dev/null || printf '%s\n' "$source_path")"
+
+  local source_prefix="${source_home%/}/"
+  local rel_path
+  if [[ "$source_path" == "$source_prefix"* ]]; then
+    rel_path="${source_path#"$source_prefix"}"
+  else
+    rel_path="sessions/$(basename "$source_path")"
+  fi
+
+  case "$rel_path" in
+    sessions/*)
+      ;;
+    archived_sessions/*)
+      rel_path="sessions/${rel_path#archived_sessions/}"
+      ;;
+    *)
+      rel_path="sessions/$rel_path"
+      ;;
+  esac
+
+  local target_path="${target_home%/}/$rel_path"
+  mkdir -p "${target_path%/*}"
+
+  if [[ -e "$target_path" || -L "$target_path" ]]; then
+    local target_real
+    target_real="$(readlink -f "$target_path" 2>/dev/null || true)"
+    if [[ -n "$target_real" && "$target_real" == "$source_real" ]]; then
+      return 0
+    fi
+    die "target profile already has a different session file for $resume_id: $target_path"
+  fi
+
+  ln -s "$source_real" "$target_path"
+}
+
+cmd_resume_help() {
+  cat <<'EOF'
+Usage:
+  codex-switch resume [--limit N]
+  codex-switch resume list [--limit N]
+  codex-switch resume [--profile <profile>] <resume-id|latest> [codex-resume-args...]
+  codex-switch resume <profile> <resume-id|latest> [codex-resume-args...]
+
+Examples:
+  codex-switch resume
+  codex-switch resume --limit 10
+  codex-switch resume latest
+  codex-switch resume jaden latest
+  codex-switch resume --profile jaden 019ded9c-2f08-7160-8962-21cca812b52f
+  codex-switch resume 019ded9c-2f08-7160-8962-21cca812b52f
+EOF
+}
+
+cmd_resume_list() {
+  local limit=3
+
+  while (($#)); do
+    case "$1" in
+      -n|--limit)
+        shift || true
+        [[ $# -gt 0 ]] || die "resume --limit requires a number"
+        limit="$1"
+        ;;
+      --limit=*)
+        limit="${1#*=}"
+        ;;
+      *)
+        die "unknown resume list option: $1"
+        ;;
+    esac
+    shift || true
+  done
+
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "resume limit must be a positive integer"
+  [[ "$limit" -gt 0 ]] || die "resume limit must be greater than 0"
+
+  mkdir -p "$SWITCH_HOME"
+  DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
+  SWITCH_HOME="$SWITCH_HOME" \
+  CODEX_SWITCH_VERSION="$VERSION" \
+  RESUME_LIMIT="$limit" \
+  python3 - <<'PY'
+import datetime as dt
+import json
+import os
+import re
+import textwrap
+from pathlib import Path
+
+default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
+switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+limit = int(os.environ["RESUME_LIMIT"])
+
+
+def iter_homes():
+    yield "default", default_home
+    if switch_home.exists():
+        for child in sorted(switch_home.iterdir()):
+            if child.is_dir():
+                yield child.name, child
+
+
+def read_account(home):
+    auth = home / "auth.json"
+    if not auth.exists():
+        return ""
+    try:
+        obj = json.loads(auth.read_text())
+    except Exception:
+        return ""
+    tokens = obj.get("tokens") if isinstance(obj.get("tokens"), dict) else {}
+    account = tokens.get("account_id") if isinstance(tokens, dict) else ""
+    return account if isinstance(account, str) else ""
+
+
+def iter_profile_groups():
+    homes = [{"profile": profile, "home": home, "account": read_account(home)} for profile, home in iter_homes()]
+    default_item = next((item for item in homes if item["profile"] == "default"), None)
+
+    merged_default_into = None
+    if default_item and default_item["account"]:
+        for item in homes:
+            if item["profile"] == "default":
+                continue
+            if item["account"] == default_item["account"]:
+                merged_default_into = item["profile"]
+                break
+
+    for item in homes:
+        if item["profile"] == "default" and merged_default_into:
+            continue
+        display = item["profile"]
+        group_homes = [item["home"]]
+        if item["profile"] == merged_default_into and default_item:
+            display = f"{item['profile']}(default)"
+            group_homes.insert(0, default_item["home"])
+        yield display, group_homes
+
+
+def parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def id_from_filename(path):
+    match = re.search(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+        path.name,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
+def timestamp_from_filename(path):
+    match = re.search(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-", path.name)
+    if not match:
+        return None
+    date_part, time_part = match.group(1).split("T", 1)
+    return parse_iso(f"{date_part}T{time_part.replace('-', ':')}+00:00")
+
+
+def clean_title(text):
+    if not isinstance(text, str):
+        return ""
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("<") and line.endswith(">"):
+            continue
+        lines.append(line)
+    title = " ".join(lines) or text.strip()
+    title = re.sub(r"\s+", " ", title)
+    return title[:80]
+
+
+def title_from_payload(payload):
+    if not isinstance(payload, dict):
+        return ""
+    message = payload.get("message")
+    if isinstance(message, str):
+        title = clean_title(message)
+        if title:
+            return title
+
+    text_elements = payload.get("text_elements")
+    if isinstance(text_elements, list):
+        parts = [part for part in text_elements if isinstance(part, str)]
+        title = clean_title(" ".join(parts))
+        if title:
+            return title
+
+    return ""
+
+
+def read_meta(path):
+    payload = {}
+    name = ""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _, line in zip(range(20), handle):
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                obj_payload = obj.get("payload", {})
+                if not isinstance(obj_payload, dict):
+                    continue
+                if obj.get("type") == "session_meta":
+                    payload = obj_payload
+                    continue
+                if obj.get("type") == "event_msg" and obj_payload.get("type") == "user_message" and not name:
+                    name = title_from_payload(obj_payload)
+                    if payload:
+                        break
+    except OSError:
+        pass
+
+    try:
+        stat = path.stat()
+        updated_at = dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc)
+    except OSError:
+        updated_at = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+
+    started_at = parse_iso(payload.get("timestamp")) or timestamp_from_filename(path) or updated_at
+    resume_id = payload.get("id") if isinstance(payload.get("id"), str) else ""
+    if not resume_id:
+        resume_id = id_from_filename(path)
+    if not resume_id:
+        return None
+
+    return {
+        "id": resume_id,
+        "started_at": started_at,
+        "updated_at": updated_at,
+        "name": name or "-",
+        "path": str(path),
+    }
+
+
+def collect_sessions():
+    profiles = []
+    for profile, homes in iter_profile_groups():
+        by_id = {}
+        for home in homes:
+            for root_name in ("sessions", "archived_sessions"):
+                root = home / root_name
+                if not root.exists():
+                    continue
+                try:
+                    files = [p for p in root.rglob("*.jsonl") if p.is_file()]
+                except OSError:
+                    continue
+                for path in files:
+                    meta = read_meta(path)
+                    if not meta:
+                        continue
+                    meta["profile"] = profile
+                    meta["home"] = str(home)
+                    existing = by_id.get(meta["id"])
+                    if existing is None:
+                        by_id[meta["id"]] = meta
+                        continue
+                    existing_key = (existing["updated_at"], existing["started_at"])
+                    meta_key = (meta["updated_at"], meta["started_at"])
+                    if meta_key > existing_key:
+                        if meta["name"] == "-" and existing.get("name") not in (None, "", "-"):
+                            meta["name"] = existing["name"]
+                        by_id[meta["id"]] = meta
+                    elif existing.get("name") in (None, "", "-") and meta.get("name") not in (None, "", "-"):
+                        existing["name"] = meta["name"]
+
+        sessions = list(by_id.values())
+        sessions.sort(key=lambda item: (item["updated_at"], item["started_at"], item["id"]), reverse=True)
+        if sessions:
+            profiles.append({"profile": profile, "sessions": sessions})
+
+    profiles.sort(key=lambda item: (item["profile"] != "default", item["profile"]))
+    selected = []
+    total = 0
+    for group in profiles:
+        total += len(group["sessions"])
+        for session in group["sessions"][:limit]:
+            selected.append(session)
+    return selected, total, len(profiles)
+
+
+def fit_text(text, width):
+    text = str(text) if text not in (None, "") else "-"
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def fmt_time(value):
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_name(value):
+    if not value or value == "-":
+        return "-"
+    return fit_text(value, 42)
+
+
+def border(fill="-"):
+    return "+" + "+".join(fill * (widths[label] + 2) for label, _ in columns) + "+"
+
+
+def row(values):
+    return "|" + "|".join(f" {str(value):<{widths[label]}} " for (label, _), value in zip(columns, values)) + "|"
+
+
+sessions, total_sessions, profile_count = collect_sessions()
+if not sessions:
+    print("No Codex sessions found.")
+    raise SystemExit(0)
+
+rows = []
+for index, item in enumerate(sessions, start=1):
+    rows.append(
+        {
+            "#": str(index),
+            "updated": fmt_time(item["updated_at"]),
+            "profile": fit_text(item["profile"], 17),
+            "id": item["id"],
+            "name": fmt_name(item["name"]),
+        }
+    )
+
+columns = [
+    ("#", "#"),
+    ("Updated", "updated"),
+    ("Profile", "profile"),
+    ("Resume ID", "id"),
+    ("Name", "name"),
+]
+widths = {
+    label: max(len(label), *(len(str(r[key])) for r in rows))
+    for label, key in columns
+}
+table_width = len(border())
+inner_width = table_width - 4
+use_color = os.isatty(1) and not os.environ.get("NO_COLOR")
+header_color = "\033[1m" if use_color else ""
+muted_color = "\033[2m" if use_color else ""
+reset_color = "\033[0m" if use_color else ""
+
+
+def colorize(line, color):
+    if not color:
+        return line
+    return f"{color}{line}{reset_color}"
+
+
+def title_line(left, right):
+    left = fit_text(left, inner_width)
+    right = fit_text(right, inner_width)
+    gap = inner_width - len(left) - len(right)
+    if gap < 1:
+        left = fit_text(left, inner_width - len(right) - 1)
+        gap = 1
+    return f"| {left}{' ' * gap}{right} |"
+
+
+print("+" + "-" * (table_width - 2) + "+")
+print(colorize(title_line("Codex Resume", f"v{os.environ.get('CODEX_SWITCH_VERSION', '0.1.0')}"), header_color))
+print(colorize(title_line(f"Showing {len(rows)} of {total_sessions} sessions", f"{limit} per profile, {profile_count} profiles"), muted_color))
+print(border("="))
+print(colorize(row([label for label, _ in columns]), header_color))
+print(border("-"))
+for item in rows:
+    print(row([item["#"], item["updated"], item["profile"], item["id"], item["name"]]))
+print(border("-"))
+notes = "Run: codex-switch resume <resume-id> to continue with the current profile, or codex-switch resume <profile> <resume-id> to choose an account."
+for line in textwrap.wrap(notes, width=inner_width) or [""]:
+    print(colorize(f"| {line:<{inner_width}} |", muted_color))
+print("+" + "-" * (table_width - 2) + "+")
+PY
+}
+
+cmd_resume_start() {
+  local target_profile=""
+
+  while (($#)); do
+    case "$1" in
+      -p|--profile)
+        shift || true
+        [[ $# -gt 0 ]] || die "resume --profile requires a profile"
+        target_profile="$1"
+        ;;
+      --profile=*)
+        target_profile="${1#*=}"
+        ;;
+      --)
+        shift || true
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift || true
+  done
+
+  local requested_id="${1:-}"
+  shift || true
+
+  [[ -n "$requested_id" ]] || die "resume id is required"
+  require_codex
+
+  if [[ -z "$target_profile" ]]; then
+    target_profile="$(current_resume_profile)"
+  fi
+
+  local target_home
+  target_home="$(resume_profile_dir "$target_profile")"
+  sync_shared_skills_to_home "$target_home" quiet
+
+  local lookup
+  if ! lookup="$(
+    DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    SWITCH_HOME="$SWITCH_HOME" \
+    REQUESTED_RESUME_ID="$requested_id" \
+    python3 - <<'PY'
+import datetime as dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
+switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+requested = os.environ["REQUESTED_RESUME_ID"].strip()
+
+
+def iter_homes():
+    yield "default", default_home
+    if switch_home.exists():
+        for child in sorted(switch_home.iterdir()):
+            if child.is_dir():
+                yield child.name, child
+
+
+def parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def id_from_filename(path):
+    match = re.search(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+        path.name,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
+def read_session(path, profile, home):
+    payload = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _, line in zip(range(20), handle):
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "session_meta":
+                    continue
+                candidate = obj.get("payload", {})
+                if isinstance(candidate, dict):
+                    payload = candidate
+                break
+    except OSError:
+        pass
+
+    resume_id = payload.get("id") if isinstance(payload.get("id"), str) else ""
+    if not resume_id:
+        resume_id = id_from_filename(path)
+    if not resume_id:
+        return None
+
+    started_at = parse_iso(payload.get("timestamp"))
+    try:
+        updated_at = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        updated_at = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+    if started_at is None:
+        started_at = updated_at
+
+    return {
+        "id": resume_id,
+        "profile": profile,
+        "home": str(home),
+        "path": str(path),
+        "is_symlink": path.is_symlink(),
+        "updated_at": updated_at,
+        "started_at": started_at,
+    }
+
+
+sessions = []
+for profile, home in iter_homes():
+    for root_name in ("sessions", "archived_sessions"):
+        root = home / root_name
+        if not root.exists():
+            continue
+        try:
+            files = [p for p in root.rglob("*.jsonl") if p.is_file()]
+        except OSError:
+            continue
+        for path in files:
+            session = read_session(path, profile, home)
+            if session:
+                sessions.append(session)
+
+sessions.sort(
+    key=lambda item: (item["updated_at"], item["started_at"], not item["is_symlink"], item["id"]),
+    reverse=True,
+)
+if not sessions:
+    print("No Codex sessions found.", file=sys.stderr)
+    raise SystemExit(1)
+
+if requested in ("latest", "-"):
+    match = sessions[0]
+else:
+    matches = [item for item in sessions if item["id"] == requested or item["id"].startswith(requested)]
+    matched_ids = sorted({item["id"] for item in matches})
+    if not matches:
+        print(f"Resume id not found across profiles: {requested}", file=sys.stderr)
+        raise SystemExit(1)
+    if len(matched_ids) > 1:
+        print(f"Resume id prefix is ambiguous: {requested}", file=sys.stderr)
+        for resume_id in matched_ids[:10]:
+            print(f"  {resume_id}", file=sys.stderr)
+        if len(matched_ids) > 10:
+            print(f"  ... {len(matched_ids) - 10} more", file=sys.stderr)
+        raise SystemExit(1)
+    matches.sort(key=lambda item: (item["updated_at"], item["started_at"], not item["is_symlink"]), reverse=True)
+    match = matches[0]
+
+print("\t".join([match["profile"], match["home"], match["id"], match["path"]]))
+PY
+  )"; then
+    return 1
+  fi
+
+  local source_profile source_home resume_id source_path
+  IFS=$'\t' read -r source_profile source_home resume_id source_path <<< "$lookup"
+  [[ -n "$source_profile" && -n "$source_home" && -n "$resume_id" && -n "$source_path" ]] || die "failed to resolve resume id: $requested_id"
+
+  link_session_to_home "$source_path" "$source_home" "$target_home" "$resume_id"
+
+  if [[ "$source_profile" == "$target_profile" ]]; then
+    printf 'Resuming %s with profile %s\n' "$resume_id" "$target_profile" >&2
+  else
+    printf 'Resuming %s with profile %s (shared from %s)\n' "$resume_id" "$target_profile" "$source_profile" >&2
+  fi
+
+  if is_default_profile "$target_profile"; then
+    env -u CODEX_PROFILE CODEX_HOME="$target_home" codex resume "$resume_id" "$@"
+  else
+    CODEX_HOME="$target_home" CODEX_PROFILE="$target_profile" codex resume "$resume_id" "$@"
+  fi
+}
+
+cmd_resume() {
+  local subcommand="${1:-}"
+
+  case "$subcommand" in
+    ""|list|ls)
+      if [[ -n "$subcommand" ]]; then
+        shift || true
+      fi
+      cmd_resume_list "$@"
+      ;;
+    -n|--limit|--limit=*)
+      cmd_resume_list "$@"
+      ;;
+    help|-h|--help)
+      cmd_resume_help
+      ;;
+    *)
+      if (($# >= 2)) && [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && profile_exists "$1"; then
+        local target_profile="$1"
+        shift || true
+        cmd_resume_start --profile "$target_profile" "$@"
+      else
+        cmd_resume_start "$@"
+      fi
+      ;;
+  esac
+}
+
 cmd_shell_init() {
   local shell_name="${1:-zsh}"
   case "$shell_name" in
@@ -650,6 +1330,9 @@ main() {
       ;;
     list)
       cmd_list
+      ;;
+    resume)
+      cmd_resume "$@"
       ;;
     logout)
       cmd_logout "$@"
