@@ -7,7 +7,12 @@ SWITCH_HOME="${CODEX_SWITCH_HOME:-$HOME/.codex-profiles}"
 DEFAULT_CODEX_HOME="${HOME}/.codex"
 SHARED_SKILLS_HOME="${CODEX_SWITCH_SHARED_HOME:-$HOME/.codex-shared}"
 SHARED_SKILLS_DIR="${CODEX_SWITCH_SHARED_SKILLS_DIR:-$SHARED_SKILLS_HOME/skills}"
-VERSION="0.2.0"
+SHARED_RESUME_HOME="${CODEX_SWITCH_SHARED_RESUME_HOME:-$SHARED_SKILLS_HOME/resume}"
+SHARED_RESUME_SESSIONS_DIR="${CODEX_SWITCH_SHARED_SESSIONS_DIR:-$SHARED_RESUME_HOME/sessions}"
+SHARED_RESUME_ARCHIVED_SESSIONS_DIR="${CODEX_SWITCH_SHARED_ARCHIVED_SESSIONS_DIR:-$SHARED_RESUME_HOME/archived_sessions}"
+SHARED_RESUME_INDEX="${CODEX_SWITCH_SHARED_SESSION_INDEX:-$SHARED_RESUME_HOME/session_index.jsonl}"
+SHARED_RESUME_ENABLED_MARKER="$SHARED_RESUME_HOME/.enabled"
+VERSION="0.3.0"
 
 usage() {
   cat <<'EOF'
@@ -20,6 +25,9 @@ Usage:
   codex-switch skills path
   codex-switch skills init
   codex-switch skills sync [profile|default|all]
+  codex-switch resume path
+  codex-switch resume init
+  codex-switch resume update
   codex-switch version
   codex-switch help
 
@@ -31,6 +39,8 @@ Examples:
   codex-switch logout default
   codex-switch skills path
   codex-switch skills sync all
+  codex-switch resume init
+  codex-switch resume update
   printenv OPENAI_API_KEY_WORK | codex-switch login api-work --with-api-key
 
 Compatibility aliases:
@@ -143,6 +153,339 @@ sync_shared_skills_to_profile() {
   sync_shared_skills_to_home "$home_dir" "${2:-quiet}"
 }
 
+ensure_shared_resume_dir() {
+  mkdir -p "$SHARED_RESUME_SESSIONS_DIR" "$SHARED_RESUME_ARCHIVED_SESSIONS_DIR"
+  [[ -e "$SHARED_RESUME_INDEX" ]] || : > "$SHARED_RESUME_INDEX"
+}
+
+enable_shared_resume() {
+  ensure_shared_resume_dir
+  : > "$SHARED_RESUME_ENABLED_MARKER"
+}
+
+is_shared_resume_enabled() {
+  [[ -f "$SHARED_RESUME_ENABLED_MARKER" ]]
+}
+
+copy_resume_tree_to_shared() {
+  local source_root="$1"
+  local dest_root="$2"
+
+  [[ -e "$source_root" ]] || return 0
+  if [[ -L "$source_root" ]]; then
+    local current_target
+    current_target="$(readlink "$source_root" || true)"
+    [[ "$current_target" == "$dest_root" ]] && return 0
+  fi
+
+  mkdir -p "$dest_root"
+  if cp --help 2>/dev/null | grep -q -- '--update'; then
+    cp -a --update=none "$source_root"/. "$dest_root"/
+  else
+    cp -an "$source_root"/. "$dest_root"/
+  fi
+}
+
+merge_shared_resume_index() {
+  ensure_shared_resume_dir
+  SHARED_RESUME_INDEX="$SHARED_RESUME_INDEX" \
+  DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
+  SWITCH_HOME="$SWITCH_HOME" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+shared_index = Path(os.environ["SHARED_RESUME_INDEX"]).expanduser()
+default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
+switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+
+homes = [default_home]
+if switch_home.exists():
+    homes.extend(child for child in sorted(switch_home.iterdir()) if child.is_dir())
+
+sources = [shared_index]
+sources.extend(home / "session_index.jsonl" for home in homes)
+
+records = {}
+for source in sources:
+    if not source.exists():
+        continue
+    if source != shared_index:
+        try:
+            if source.samefile(shared_index):
+                continue
+        except OSError:
+            pass
+    try:
+        lines = source.read_text(errors="ignore").splitlines()
+    except Exception:
+        continue
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        session_id = obj.get("id")
+        if not session_id:
+            continue
+        previous = records.get(session_id)
+        if previous is None or str(obj.get("updated_at", "")) >= str(previous.get("updated_at", "")):
+            records[session_id] = obj
+
+tmp = shared_index.with_suffix(shared_index.suffix + ".tmp")
+with tmp.open("w", encoding="utf-8") as fh:
+    for obj in sorted(records.values(), key=lambda item: str(item.get("updated_at", ""))):
+        fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+tmp.replace(shared_index)
+PY
+}
+
+sync_all_resume_sources_to_shared() {
+  ensure_shared_resume_dir
+
+  copy_resume_tree_to_shared "$DEFAULT_CODEX_HOME/sessions" "$SHARED_RESUME_SESSIONS_DIR"
+  copy_resume_tree_to_shared "$DEFAULT_CODEX_HOME/archived_sessions" "$SHARED_RESUME_ARCHIVED_SESSIONS_DIR"
+
+  if [[ -d "$SWITCH_HOME" ]]; then
+    local dir
+    shopt -s nullglob
+    for dir in "$SWITCH_HOME"/*; do
+      [[ -d "$dir" ]] || continue
+      copy_resume_tree_to_shared "$dir/sessions" "$SHARED_RESUME_SESSIONS_DIR"
+      copy_resume_tree_to_shared "$dir/archived_sessions" "$SHARED_RESUME_ARCHIVED_SESSIONS_DIR"
+    done
+    shopt -u nullglob
+  fi
+
+  merge_shared_resume_index
+}
+
+backup_resume_path() {
+  local home_dir="$1"
+  local target="$2"
+  local name="$3"
+  local stamp
+  local backup_dir
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$home_dir/.codex-switch-backup/$stamp"
+  mkdir -p "$backup_dir"
+  mv "$target" "$backup_dir/$name"
+}
+
+link_shared_resume_path() {
+  local home_dir="$1"
+  local name="$2"
+  local shared_path="$3"
+  local target="$home_dir/$name"
+
+  mkdir -p "$home_dir"
+  if [[ -L "$target" ]]; then
+    local current_target
+    current_target="$(readlink "$target" || true)"
+    [[ "$current_target" == "$shared_path" ]] && return 0
+    backup_resume_path "$home_dir" "$target" "$name"
+  elif [[ -e "$target" ]]; then
+    backup_resume_path "$home_dir" "$target" "$name"
+  fi
+
+  ln -s "$shared_path" "$target"
+}
+
+link_shared_resume_to_home() {
+  local home_dir="$1"
+  link_shared_resume_path "$home_dir" "sessions" "$SHARED_RESUME_SESSIONS_DIR"
+  link_shared_resume_path "$home_dir" "archived_sessions" "$SHARED_RESUME_ARCHIVED_SESSIONS_DIR"
+  link_shared_resume_path "$home_dir" "session_index.jsonl" "$SHARED_RESUME_INDEX"
+}
+
+merge_resume_state_to_home() {
+  local target_home="$1"
+
+  TARGET_HOME="$target_home" \
+  DEFAULT_CODEX_HOME="$DEFAULT_CODEX_HOME" \
+  SWITCH_HOME="$SWITCH_HOME" \
+  python3 - <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+target_home = Path(os.environ["TARGET_HOME"]).expanduser()
+default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
+switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+target_db = target_home / "state_5.sqlite"
+thread_tables = [
+    "threads",
+    "stage1_outputs",
+    "thread_dynamic_tools",
+    "thread_goals",
+    "thread_spawn_edges",
+]
+
+homes = [default_home]
+if switch_home.exists():
+    homes.extend(child for child in sorted(switch_home.iterdir()) if child.is_dir())
+
+source_dbs = []
+seen = set()
+for home in homes:
+    db = home / "state_5.sqlite"
+    if not db.exists():
+        continue
+    try:
+        key = db.resolve()
+    except OSError:
+        key = db
+    if key in seen:
+        continue
+    seen.add(key)
+    source_dbs.append(db)
+
+if not source_dbs:
+    raise SystemExit(0)
+
+def connect_readonly(path: Path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+def table_names(con):
+    return {
+        row[0]
+        for row in con.execute("select name from sqlite_master where type='table'")
+    }
+
+def table_columns(con, table):
+    return [row[1] for row in con.execute(f"pragma table_info({table})")]
+
+def placeholders(count):
+    return ",".join("?" for _ in range(count))
+
+def quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+def ensure_target_schema():
+    if target_db.exists():
+        return
+    target_home.mkdir(parents=True, exist_ok=True)
+    with connect_readonly(source_dbs[0]) as src, sqlite3.connect(target_db) as dst:
+        rows = src.execute(
+            """
+            select type, name, sql
+            from sqlite_master
+            where sql is not null
+              and name not like 'sqlite_%'
+            order by case type
+                when 'table' then 0
+                when 'index' then 1
+                when 'trigger' then 2
+                when 'view' then 3
+                else 4
+            end, name
+            """
+        ).fetchall()
+        for _, _, sql in rows:
+            try:
+                dst.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+        if "_sqlx_migrations" in table_names(src) and "_sqlx_migrations" in table_names(dst):
+            cols = table_columns(src, "_sqlx_migrations")
+            col_sql = ",".join(quote_ident(col) for col in cols)
+            for row in src.execute(f"select {col_sql} from _sqlx_migrations"):
+                dst.execute(
+                    f"insert or ignore into _sqlx_migrations ({col_sql}) values ({placeholders(len(cols))})",
+                    row,
+                )
+
+def row_timestamp(cols, row):
+    for name in ("updated_at_ms", "updated_at"):
+        if name in cols:
+            value = row[cols.index(name)]
+            if value is not None:
+                return int(value)
+    return 0
+
+ensure_target_schema()
+
+with sqlite3.connect(target_db) as dst:
+    dst.execute("pragma foreign_keys=off")
+    dst_tables = table_names(dst)
+    for source_db in source_dbs:
+        try:
+            if source_db.resolve() == target_db.resolve():
+                continue
+        except OSError:
+            if source_db == target_db:
+                continue
+        with connect_readonly(source_db) as src:
+            src_tables = table_names(src)
+            for table in thread_tables:
+                if table not in src_tables or table not in dst_tables:
+                    continue
+                src_cols = table_columns(src, table)
+                dst_cols = table_columns(dst, table)
+                common_cols = [col for col in src_cols if col in dst_cols]
+                if not common_cols:
+                    continue
+                col_sql = ",".join(quote_ident(col) for col in common_cols)
+                select_sql = f"select {col_sql} from {quote_ident(table)}"
+                insert_sql = (
+                    f"insert or replace into {quote_ident(table)} ({col_sql}) "
+                    f"values ({placeholders(len(common_cols))})"
+                )
+                if table == "threads":
+                    id_index = common_cols.index("id")
+                    for row in src.execute(select_sql):
+                        thread_id = row[id_index]
+                        existing = dst.execute(
+                            "select updated_at_ms, updated_at from threads where id = ?",
+                            (thread_id,),
+                        ).fetchone()
+                        if existing is not None:
+                            existing_ts = existing[0] if existing[0] is not None else existing[1]
+                            if int(existing_ts or 0) > row_timestamp(common_cols, row):
+                                continue
+                        dst.execute(insert_sql, row)
+                else:
+                    for row in src.execute(select_sql):
+                        dst.execute(insert_sql, row)
+    dst.commit()
+PY
+}
+
+sync_shared_resume_to_home() {
+  local home_dir="$1"
+  local mode="${2:-quiet}"
+
+  sync_all_resume_sources_to_shared
+  link_shared_resume_to_home "$home_dir"
+  merge_resume_state_to_home "$home_dir"
+
+  if [[ "$mode" == "verbose" ]]; then
+    printf 'Synced shared resume into %s\n' "$home_dir"
+  fi
+}
+
+sync_shared_resume_to_profile() {
+  local profile="${1:-default}"
+  local home_dir
+  home_dir="$(profile_dir "$profile")"
+  mkdir -p "$home_dir"
+  sync_shared_resume_to_home "$home_dir" "${2:-quiet}"
+}
+
+sync_shared_resume_current_if_enabled() {
+  is_shared_resume_enabled || return 0
+
+  local current_home="${CODEX_HOME:-$DEFAULT_CODEX_HOME}"
+  [[ -d "$current_home" ]] || return 0
+  sync_shared_resume_to_home "$current_home" quiet
+}
+
+sync_shared_resume_to_profile_if_enabled() {
+  is_shared_resume_enabled || return 0
+  sync_shared_resume_to_profile "$1" quiet
+}
+
 cmd_login() {
   local profile="${1:-}"
   shift || true
@@ -162,6 +505,9 @@ cmd_login() {
   sync_shared_skills_to_home "$dir" quiet
 
   CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex login "$@"
+  if is_shared_resume_enabled; then
+    sync_shared_resume_to_home "$dir" quiet
+  fi
 }
 
 cmd_logout() {
@@ -197,6 +543,9 @@ cmd_run() {
   dir="$(profile_dir "$profile")"
   [[ -d "$dir" ]] || die "profile '$profile' does not exist; run 'codex-switch create $profile' first"
 
+  sync_shared_resume_current_if_enabled
+  sync_shared_resume_to_profile_if_enabled "$profile"
+
   CODEX_HOME="$dir" CODEX_PROFILE="$profile" codex "$@"
 }
 
@@ -208,6 +557,8 @@ cmd_switch() {
   local profile="${1:-}"
 
   if is_default_profile "$profile"; then
+    sync_shared_resume_current_if_enabled
+    sync_shared_resume_to_profile_if_enabled default
     cat <<'EOF'
 unset CODEX_HOME
 unset CODEX_PROFILE
@@ -220,7 +571,9 @@ EOF
   local dir
   dir="$(profile_dir "$profile")"
   [[ -d "$dir" ]] || die "profile '$profile' does not exist"
+  sync_shared_resume_current_if_enabled
   sync_shared_skills_to_home "$dir" quiet
+  sync_shared_resume_to_profile_if_enabled "$profile"
 
   printf 'export CODEX_HOME=%s\n' "$(shell_quote "$dir")"
   printf 'export CODEX_PROFILE=%s\n' "$(shell_quote "$profile")"
@@ -272,9 +625,52 @@ cmd_skills() {
   esac
 }
 
+cmd_resume() {
+  local subcommand="${1:-path}"
+  shift || true
+
+  case "$subcommand" in
+    path)
+      ensure_shared_resume_dir
+      printf '%s\n' "$SHARED_RESUME_HOME"
+      ;;
+    init)
+      enable_shared_resume
+      sync_shared_resume_to_profile default verbose
+      if [[ -d "$SWITCH_HOME" ]]; then
+        local dir
+        shopt -s nullglob
+        for dir in "$SWITCH_HOME"/*; do
+          [[ -d "$dir" ]] || continue
+          sync_shared_resume_to_home "$dir" verbose
+        done
+        shopt -u nullglob
+      fi
+      printf 'Shared resume root: %s\n' "$SHARED_RESUME_HOME"
+      ;;
+    update)
+      enable_shared_resume
+      sync_shared_resume_to_profile default verbose
+      if [[ -d "$SWITCH_HOME" ]]; then
+        local dir
+        shopt -s nullglob
+        for dir in "$SWITCH_HOME"/*; do
+          [[ -d "$dir" ]] || continue
+          sync_shared_resume_to_home "$dir" verbose
+        done
+        shopt -u nullglob
+      fi
+      printf 'Shared resume root: %s\n' "$SHARED_RESUME_HOME"
+      ;;
+    *)
+      die "unknown resume command: $subcommand"
+      ;;
+  esac
+}
+
 known_command() {
   case "${1:-}" in
-    login|switch|use|activate|list|logout|skills|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
+    login|switch|use|activate|list|logout|skills|resume|run|exec|off|deactivate|shell-init|init-shell|version|--version|-V|help|-h|--help)
       return 0
       ;;
     *)
@@ -310,6 +706,7 @@ import datetime as dt
 import json
 import os
 import re
+import sqlite3
 import textwrap
 from pathlib import Path
 
@@ -406,11 +803,27 @@ def read_auth(home: Path):
 
 
 def read_usage(home: Path):
-    roots = [home / "sessions", home / "archived_sessions"]
     files = []
-    for root in roots:
-        if root.exists():
-            files.extend(p for p in root.rglob("*.jsonl") if p.is_file())
+    state_db = home / "state_5.sqlite"
+    if state_db.exists():
+        home_prefix = str(home) + os.sep
+        try:
+            con = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            rows = con.execute("select rollout_path from threads order by updated_at desc").fetchall()
+            con.close()
+            for (rollout_path,) in rows:
+                if not isinstance(rollout_path, str) or not rollout_path.startswith(home_prefix):
+                    continue
+                path = Path(rollout_path)
+                if path.is_file():
+                    files.append(path)
+        except Exception:
+            files = []
+    if not files:
+        roots = [home / "sessions", home / "archived_sessions"]
+        for root in roots:
+            if root.exists():
+                files.extend(p for p in root.rglob("*.jsonl") if p.is_file())
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     limit_reset = "-"
@@ -442,6 +855,10 @@ def read_usage(home: Path):
     return empty_usage()
 
 
+def has_usage(usage):
+    return any(usage.get(key) != "-" for key in ("primary", "secondary", "primary_reset", "secondary_reset", "plan"))
+
+
 rows = []
 homes = [("default", default_home)]
 if switch_home.exists():
@@ -456,7 +873,7 @@ for name, home in homes:
       current = "*"
     else:
       current = " "
-    if name == "default" and not auth["has_auth"] and current != "*":
+    if name == "default" and not auth["has_auth"] and not has_usage(usage) and current != "*":
       continue
     rows.append({
         "current": current,
@@ -656,6 +1073,9 @@ main() {
       ;;
     skills)
       cmd_skills "$@"
+      ;;
+    resume)
+      cmd_resume "$@"
       ;;
     run|exec)
       cmd_run "$@"
