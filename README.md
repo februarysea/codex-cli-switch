@@ -9,12 +9,11 @@ Instead, it keeps one home directory per account and switches between them.
 
 ## Daily commands
 
-You only need these 4 commands:
+You only need these 3 commands:
 
 - `codex-switch <profile>`: switch directly to a profile
 - `login`: create or reuse a profile, then log that profile into a Codex account
 - `list`: show all profiles plus the last known Codex usage snapshot for each one
-- `resume`: show recent conversations across all profiles and resume one by id
 
 Optional cleanup command:
 
@@ -65,32 +64,6 @@ codex-switch default
 ```
 
 After switching, any plain `codex` command in that shell uses that account.
-
-Resume recent conversations across profiles:
-
-```bash
-codex-switch resume
-codex-switch resume --limit 10
-codex-switch resume latest
-codex-switch resume jaden latest
-codex-switch resume --profile jaden 019ded9c-2f08-7160-8962-21cca812b52f
-codex-switch resume 019ded9c-2f08-7160-8962-21cca812b52f
-```
-
-`codex-switch resume` scans `sessions` and `archived_sessions` under `~/.codex`
-and every profile under `~/.codex-profiles`, then shows the latest 3 local
-conversation ids for each profile by update time. The `Name` column is derived
-from the first user message in the local session log. If `default` and another
-profile are logged into the same account, they are merged like `list`, for
-example `hunk(default)`. `codex-switch resume <id>` continues that conversation
-with the current shell profile. To continue with a different account directly,
-run `codex-switch resume <profile> <id>` or `codex-switch resume --profile
-<profile> <id>`.
-
-When the target profile does not already have that local conversation file,
-`codex-switch` creates a symlink to the original session jsonl before running
-`codex resume <id>`. That keeps different accounts writing to the same local
-conversation history instead of forking separate copies.
 
 ## Shared skills
 
@@ -158,9 +131,6 @@ Notes:
 codex-switch <profile|default>
 codex-switch login <profile> [codex-login-args...]
 codex-switch list
-codex-switch resume [--limit N]
-codex-switch resume [--profile <profile>] <resume-id|latest> [codex-resume-args...]
-codex-switch resume <profile> <resume-id|latest> [codex-resume-args...]
 codex-switch logout [profile|default]
 codex-switch skills path
 codex-switch skills init
