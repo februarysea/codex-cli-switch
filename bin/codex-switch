@@ -12,7 +12,7 @@ SHARED_RESUME_SESSIONS_DIR="${CODEX_SWITCH_SHARED_SESSIONS_DIR:-$SHARED_RESUME_H
 SHARED_RESUME_ARCHIVED_SESSIONS_DIR="${CODEX_SWITCH_SHARED_ARCHIVED_SESSIONS_DIR:-$SHARED_RESUME_HOME/archived_sessions}"
 SHARED_RESUME_INDEX="${CODEX_SWITCH_SHARED_SESSION_INDEX:-$SHARED_RESUME_HOME/session_index.jsonl}"
 SHARED_RESUME_ENABLED_MARKER="$SHARED_RESUME_HOME/.enabled"
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 usage() {
   cat <<'EOF'
@@ -706,7 +706,9 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -714,6 +716,7 @@ current_home = os.environ.get("CURRENT_CODEX_HOME", "")
 current_profile = os.environ.get("CURRENT_CODEX_PROFILE", "default")
 default_home = Path(os.environ["DEFAULT_CODEX_HOME"]).expanduser()
 switch_home = Path(os.environ["SWITCH_HOME"]).expanduser()
+codex_bin = shutil.which("codex")
 
 
 def fmt_percent(value):
@@ -802,6 +805,60 @@ def read_auth(home: Path):
     }
 
 
+def read_login_status(home: Path, profile: str):
+    if not codex_bin or not home.exists():
+        return None
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home)
+    if profile == "default":
+        env.pop("CODEX_PROFILE", None)
+    else:
+        env["CODEX_PROFILE"] = profile
+
+    try:
+        result = subprocess.run(
+            [codex_bin, "login", "status"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    lowered = output.lower()
+    if "not logged in" in lowered:
+        return {"logged_in": "no", "mode": "-", "account": "-", "has_auth": False}
+
+    match = re.search(r"logged in using\s+(.+)", output, re.IGNORECASE)
+    if result.returncode == 0 and match:
+        return {"logged_in": "yes", "mode": match.group(1).strip(), "has_auth": True}
+
+    return None
+
+
+def apply_login_status(auth, status):
+    if not status:
+        return auth
+    if status["logged_in"] == "no":
+        return {
+            "logged_in": "no",
+            "mode": "-",
+            "account": "-",
+            "has_auth": auth["has_auth"],
+        }
+    return {
+        "logged_in": "yes",
+        "mode": status.get("mode") or auth["mode"],
+        "account": auth["account"],
+        "has_auth": True,
+    }
+
+
 def read_usage(home: Path):
     files = []
     state_db = home / "state_5.sqlite"
@@ -867,7 +924,9 @@ if switch_home.exists():
             homes.append((child.name, child))
 
 for name, home in homes:
+    status = read_login_status(home, name)
     auth = read_auth(home)
+    auth = apply_login_status(auth, status)
     usage = read_usage(home)
     if str(home) == current_home or (name == "default" and not current_home):
       current = "*"
@@ -898,10 +957,16 @@ if default_row and default_row["account"] not in ("-", ""):
         if row["profile"] == "default":
             continue
         if row["account"] == default_row["account"]:
-            row["profile"] = f"{row['profile']}(default)"
+            merged_profile = f"{row['profile']}(default)"
+            replacement = default_row.copy() if default_row["current"] == "*" else row
+            replacement["profile"] = merged_profile
             if default_row["current"] == "*":
-                row["current"] = "*"
-            rows = [r for r in rows if r["profile"] != "default"]
+                replacement["current"] = "*"
+            rows = [
+                replacement if r is row else r
+                for r in rows
+                if r is not default_row
+            ]
             break
 
 
